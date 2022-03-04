@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+
+checkout() {
+    curl -sL "https://github.com/libgit2/libgit2/archive/v${VERSION}.tar.gz" | \
+        tar -xz -C "$SRCDIR" --strip-components=1
+    cd "$SRCDIR"
+    # Don't output -lrt to pkg-config file
+    sed -i.original "s/^IF(NEED_LIBRT)\$/IF(FALSE)/" src/CMakeLists.txt
+    sed -i.original "s/^IF (CMAKE_SYSTEM_NAME MATCHES \"Darwin\")\$/IF (CMAKE_SYSTEM_NAME MATCHES "iOS")/" cmake/SelectHTTPSBackend.cmake
+}
+
+configure() {
+    if [ $PLATFORM = 'ios' ]; then
+      HTTPS_BACKEND=SecureTransport
+    elif [ $PLATFORM = 'android' ]; then
+      HTTPS_BACKEND=mbedTLS
+    else
+      >&2 echo "Unknown platform: $PLATFORM"
+      exit -1
+    fi
+    cd "$BUILDDIR"
+    cmake -GNinja \
+          $CMAKE_ARGS \
+          -DUSE_HTTPS=$HTTPS_BACKEND \
+          -DUSE_ICONV=OFF \
+          -DBUILD_CLAR=OFF \
+          "$SRCDIR"
+}
+
+build() {
+    ninja -C "$BUILDDIR" install
+}

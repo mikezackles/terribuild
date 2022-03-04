@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import pathlib
+import shutil
+import subprocess
+import tempfile
+
+def add_arg(s, arg):
+    return ' '.join([s.strip(), arg])
+
+def whitelist_dir(root, deps):
+    whitelist = [f'{name}-{version}' for name, version in deps]
+    for directory in root.glob('*.tbld'):
+        if not directory.name in whitelist:
+            shutil.rmtree(directory)
+
+def android_cmake_args(platform, ndk_path):
+    arches = {
+        'aarch64': 'arm64-v8a',
+        'armv7a': 'armeabi-v7a',
+        'i686': 'x86',
+        'x86_64': 'x86_64'
+    }
+
+    assert platform['arch'] in arches, f'Unknown architecture: {arch}'
+
+    cmake_toolchain = ndk_path / 'build' / 'cmake' / 'android.toolchain.cmake'
+
+    return (
+        f'-DANDROID_ABI={arches[platform["arch"]]} '
+        f'-DCMAKE_TOOLCHAIN_FILE={cmake_toolchain} '
+        f'-DANDROID_NATIVE_API_LEVEL={platform["api_level"]}'
+    )
+
+def android_compilers(platform, ndk_path):
+    arch = platform['arch']
+    if arch != 'armv7a':
+        api = f'android{platform["api_level"]}'
+    else:
+        api = f'androideabi{platform["api_level"]}'
+    ndk_bin = ndk_path / 'toolchains' / 'llvm' / 'prebuilt' / 'linux-x86_64' / 'bin'
+    cc = ndk_bin / f'{arch}-linux-{api}-clang'
+    cxx = ndk_bin / f'{arch}-linux-{api}-clang++'
+    ar = ndk_bin / f'{arch}-linux-{api}-ar'
+    return (cc, cxx, ar)
+
+def ios_compilers():
+    flags = (
+        '-arch arm64 '
+        '-fno-aligned-allocation '
+        '-miphoneos-version-min=13.0 '
+        '-isysroot /Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk'
+    )
+    return (f'clang {flags}', f'clang++ {flags}', 'ar')
+
+def ios_cmake_args(platform, cmake_ios_dir):
+    assert platform['arch'] in [
+        'OS', 'OS64', 'OS64COMBINED', 'SIMULATOR', 'SIMULATOR64', 'TVOS',
+        'TVOSCOMBINED', 'SIMULATOR_TVOS', 'WATCHOS', 'WATCHOSCOMBINED',
+        'SIMULATOR_WATCHOS', 'MAC', 'MAC_ARM64', 'MAC_CATALYST',
+        'MAC_CATALYST_ARM64']
+    cmake_toolchain = cmake_ios_dir / 'ios.toolchain.cmake'
+
+    return (
+        f'-DCMAKE_TOOLCHAIN_FILE={cmake_toolchain} '
+        f'-DPLATFORM={platform["arch"]} '
+        f'-DENABLE_BITCODE=True '
+    )
+
+def get_cmake_args(platform, prefix, **kwargs):
+    if platform['name'] == 'android':
+        cmake_args = android_cmake_args(platform, kwargs['ndk_path'])
+    else:
+        cmake_args = ios_cmake_args(platform, kwargs['cmake_ios_dir'])
+    return add_arg(cmake_args, (
+        f'-DBUILD_SHARED_LIBS=OFF '
+        f'-DCMAKE_FIND_ROOT_PATH={prefix} '
+        f'-DCMAKE_INSTALL_PREFIX={prefix} '
+        f'-DCMAKE_BUILD_TYPE=RelWithDebInfo'
+    ))
+
+def get_compilers(platform, **kwargs):
+    if platform['name'] == 'android':
+        return android_compilers(platform, kwargs['ndk_path'])
+    else:
+        return ios_compilers()
+
+def get_meson_args(platform, cross_dir):
+    if platform['name'] == 'android':
+        arch_ini = cross_dir / 'android' / f'{platform["arch"]}.ini'
+        base_cross = cross_dir / 'android' / 'base.cross'
+        args = (
+            f'--cross-file={arch_ini} '
+            f'--cross-file={base_cross}'
+        )
+    else:
+        cross = cross_dir / 'ios.cross'
+        args = f'--cross-file={cross}'
+
+    return add_arg(args, (
+        '-D default_library=static '
+        '-D optimization=3 '
+        '-D debug=true'
+    ))
+
+def get_pkgconfig_dir(prefix):
+    pkgdir_lib = prefix / 'lib' / 'pkgconfig'
+    pkgdir_share = prefix / 'share' / 'pkgconfig'
+    return f'{pkgdir_lib}:{pkgdir_share}'
+
+class Terri:
+    def __init__(self, platform, **kwargs):
+        assert platform['name'] in ['android', 'ios']
+
+        workdir = kwargs['workdir']
+        self.sourceroot = workdir / 'sources'
+        self.buildroot = workdir / platform['arch'] / 'build'
+        self.prefix = workdir / platform['arch'] / 'install'
+        self.installroot = workdir / platform['arch'] / 'installed'
+
+        self.deps = kwargs['deps']
+        self.scripts_dir = kwargs['scripts_dir']
+
+        self.env = {}
+        self.env['PLATFORM'] = platform['name']
+        self.env['CMAKE_ARGS'] = get_cmake_args(
+            platform, self.prefix, **kwargs)
+        self.env['MESON_ARGS'] = get_meson_args(
+            platform, kwargs['meson_cross_dir'])
+        self.env['PATH'] = os.environ['PATH']
+        cc, cxx, ar = get_compilers(platform, **kwargs)
+        self.env['CC'] = cc
+        self.env['CXX'] = cxx
+        self.env['AR'] = ar
+        self.env['PKG_CONFIG_LIBDIR'] = get_pkgconfig_dir(self.prefix)
+
+        whitelist_dir(self.sourceroot, self.deps)
+        whitelist_dir(self.buildroot, self.deps)
+
+    def checkout(self, script, name, version):
+        basename = f'{name}-{version}'
+        srcdir = self.sourceroot / basename
+        if srcdir.exists():
+            print(f'Skipping existing checkout: {basename}')
+        else:
+            env = self.env.copy()
+            srcdir.mkdir(parents=True, exist_ok=True)
+            env['VERSION'] = version
+            env['SRCDIR'] = str(srcdir)
+            env['FILESDIR'] = str(self.scripts_dir / f'{name}.files')
+            script = f'source {script} && set -ex && checkout'
+            try:
+                subprocess.check_call(['bash', '-c', script], env=env)
+            except:
+                shutil.rmtree(srcdir)
+                raise
+
+    def configure(self, script, name, version):
+        basename = f'{name}-{version}'
+        builddir = self.buildroot / basename
+        if builddir.exists():
+            print(f'Skipping existing configure: {basename}')
+        else:
+            env = self.env.copy()
+            builddir.mkdir(parents=True, exist_ok=True)
+            env['SRCDIR'] = str(self.sourceroot / basename)
+            env['BUILDDIR'] = str(builddir)
+            env['PREFIX'] = str(self.prefix)
+            script = f'source {script} && set -ex && configure'
+            try:
+                subprocess.check_call(['bash', '-c', script], env=env)
+            except:
+                shutil.rmtree(builddir)
+                raise
+
+    def build(self, script, name, version):
+        basename = f'{name}-{version}'
+        builddir = self.buildroot / basename
+        installfile = self.installroot / basename
+        assert builddir.exists()
+
+        if installfile.exists():
+            print(f'Skipping existing install: {basename}')
+        else:
+            env = self.env.copy()
+            env['BUILDDIR'] = str(builddir)
+            env['PREFIX'] = str(self.prefix)
+            script = f'source {script} && set -ex && build'
+            try:
+                subprocess.check_call(['bash', '-c', script], env=env)
+            except:
+                shutil.rmtree(builddir)
+                raise
+            self.installroot.mkdir(parents=True, exist_ok=True)
+            installfile.touch()
+
+    def build_all(self):
+        self.prefix.mkdir(parents=True, exist_ok=True)
+        for name, version in self.deps:
+            basename = f'{name}.tbld'
+            script = self.scripts_dir / basename
+            assert script.exists(), f"Couldn't find build script: {basename}"
+            self.checkout(script, name, version)
+            self.configure(script, name, version)
+            self.build(script, name, version)
+
+scriptdir = pathlib.Path(__file__).parent
+deps = [
+    ('zlib', '1.2.11'),
+    ('mbedTLS', '2.27.0'),
+    ('libssh2', '1.9.0'),
+    ('libgit2', '1.1.1')
+]
+
+parser = argparse.ArgumentParser()
+subparsers = parser.add_subparsers(dest='subparser', required=True)
+android_parser = subparsers.add_parser('android')
+android_parser.add_argument('--arch', required=True)
+android_parser.add_argument('--api-level', type=int, required=True)
+ios_parser = subparsers.add_parser('ios')
+ios_parser.add_argument('--arch', required=True)
+args = parser.parse_args()
+
+platform = {'name': args.subparser}
+platform['arch'] = args.arch
+if args.subparser == 'android':
+    platform['api_level'] = args.api_level
+
+repo_dir = scriptdir.parent.resolve()
+work_dir = repo_dir / f'build_{platform["name"]}' / 'dependencies'
+
+ndk_path = pathlib.Path(os.sep) / 'opt' / 'android-ndk'
+cmake_ios_dir = repo_dir / 'cmake_cross' / 'ios-cmake'
+meson_cross_dir = repo_dir / 'meson_cross'
+
+terri = Terri(
+    platform,
+    workdir = work_dir,
+    scripts_dir = scriptdir,
+    deps = deps,
+    ndk_path = ndk_path,
+    cmake_ios_dir = cmake_ios_dir,
+    meson_cross_dir = meson_cross_dir)
+
+terri.build_all()

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+
+checkout() {
+    curl -sL "https://github.com/ARMmbed/mbedtls/archive/v${VERSION}.tar.gz" | \
+        tar -xz -C "$SRCDIR" --strip-components=1
+    cd "$SRCDIR"
+    sed -i'.original' "s|^//#define MBEDTLS_MD4_C$|#define MBEDTLS_MD4_C|" \
+        include/mbedtls/config.h
+}
+
+configure() {
+    cd "$BUILDDIR"
+    cmake -GNinja \
+          $CMAKE_ARGS \
+          -DENABLE_ZLIB_SUPPORT=ON \
+          -DMBEDTLS_FATAL_WARNINGS=OFF \
+          "$SRCDIR"
+}
+
+build() {
+    ninja -C "$BUILDDIR" install
+}

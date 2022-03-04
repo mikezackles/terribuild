@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+
+checkout() {
+    curl -sL "https://github.com/libssh2/libssh2/archive/libssh2-${VERSION}.tar.gz" | \
+        tar -xz -C "$SRCDIR" --strip-components=1
+}
+
+configure() {
+    cd "$BUILDDIR"
+    cmake -GNinja \
+          $CMAKE_ARGS \
+          -DCRYPTO_BACKEND=mbedTLS \
+          -DBUILD_EXAMPLES=OFF \
+          -DBUILD_TESTING=OFF \
+          -DENABLE_ZLIB_COMPRESSION=ON \
+          "$SRCDIR"
+}
+
+build() {
+    ninja -C "$BUILDDIR" install
+}

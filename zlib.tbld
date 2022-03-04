@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+
+checkout() {
+  curl -sL "https://github.com/madler/zlib/archive/v${VERSION}.tar.gz" | \
+    tar -xz -C "$SRCDIR" --strip-components=1
+}
+
+configure() {
+  cd "$BUILDDIR"
+  cmake -GNinja $CMAKE_ARGS "$SRCDIR"
+}
+
+build() {
+  ninja -C "$BUILDDIR" install
+}
